@@ -523,6 +523,7 @@ target_link_libraries(ceph-dencoder
   blkid
   udev
   keyutils
+  librbd_replay
   ${EXTRALIBS}
   ${TCMALLOC_LIBS}
   ${CMAKE_DL_LIBS}
@@ -895,11 +896,12 @@ if(${WITH_RBD})
   add_library(librbd_replay_types STATIC ${librbd_replay_types_srcs})
 
   set(librbd_replay_srcs
-      rbd_replay/actions.cc
-      rbd_replay/BufferReader.cc
-      rbd_replay/ImageNameMap.cc
-      rbd_replay/PendingIO.cc
-      rbd_replay/rbd_loc.cc
+      rbd_replay/actions.cc 
+      rbd_replay/ActionTypes.cc 
+      rbd_replay/BufferReader.cc 
+      rbd_replay/ImageNameMap.cc 
+      rbd_replay/PendingIO.cc 
+      rbd_replay/rbd_loc.cc 
       rbd_replay/Replayer.cc)
   add_library(librbd_replay STATIC ${librbd_replay_srcs})
   target_link_libraries(librbd_replay PRIVATE librbd_replay_types librbd librados global udev)
