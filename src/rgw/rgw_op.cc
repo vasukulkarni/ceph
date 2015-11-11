@@ -358,35 +358,30 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
 
   s->bucket_acl = new RGWAccessControlPolicy(s->cct);
 
-  if (s->copy_source) { /* check if copy source is within the current domain */
-    const char *src = s->copy_source;
-    if (*src == '/')
-      ++src;
-    string copy_source_str(src);
-
-    int pos = copy_source_str.find('/');
-    if (pos > 0)
-      copy_source_str = copy_source_str.substr(0, pos);
-
+  /* check if copy source is within the current domain */
+  if (!s->src_bucket_name.empty()) {
     RGWBucketInfo source_info;
 
-    ret = store->get_bucket_info(obj_ctx, copy_source_str, source_info, NULL);
+    ret = store->get_bucket_info(obj_ctx,
+        s->src_tenant_name, s->src_bucket_name, source_info, NULL);
     if (ret == 0) {
       string& region = source_info.region;
       s->local_source = store->region.equals(region);
     }
   }
 
-  if (!s->bucket_name_str.empty()) {
+  if (!s->bucket_name.empty()) {
     s->bucket_exists = true;
     if (s->bucket_instance_id.empty()) {
-      ret = store->get_bucket_info(obj_ctx, s->bucket_name_str, s->bucket_info, NULL, &s->bucket_attrs);
+      ret = store->get_bucket_info(obj_ctx, s->bucket_tenant, s->bucket_name, s->bucket_info, NULL, &s->bucket_attrs);
     } else {
       ret = store->get_bucket_instance_info(obj_ctx, s->bucket_instance_id, s->bucket_info, NULL, &s->bucket_attrs);
     }
     if (ret < 0) {
       if (ret != -ENOENT) {
-        ldout(s->cct, 0) << "NOTICE: couldn't get bucket from bucket_name (name=" << s->bucket_name_str << ")" << dendl;
+        string bucket_log;
+        rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name, bucket_log);
+        ldout(s->cct, 0) << "NOTICE: couldn't get bucket from bucket_name (name=" << bucket_log << ")" << dendl;
         return ret;
       }
       s->bucket_exists = false;
@@ -825,7 +820,8 @@ int RGWGetObj::handle_user_manifest(const char *prefix)
     RGWBucketInfo bucket_info;
     map<string, bufferlist> bucket_attrs;
     RGWObjectCtx obj_ctx(store);
-    int r = store->get_bucket_info(obj_ctx, s->tenant, bucket_name, bucket_info, NULL, &bucket_attrs);
+    int r = store->get_bucket_info(obj_ctx, s->user.user_id.tenant, bucket_name,
+                                   bucket_info, NULL, &bucket_attrs);
     if (r < 0) {
       ldout(s->cct, 0) << "could not get bucket info for bucket=" << bucket_name << dendl;
       return r;
@@ -1335,6 +1331,11 @@ int RGWCreateBucket::verify_permission()
   if (!rgw_user_is_authenticated(s->user))
     return -EACCES;
 
+  /* XXX: maybe we need to check ACLs here! */
+  // if ((s->perm_mask & RGW_PERM_WRITE) == 0) {
+  //   return -EACCES;
+  // }
+
   if (s->user.max_buckets) {
     RGWUserBuckets buckets;
     string marker;
@@ -1387,7 +1388,9 @@ void RGWCreateBucket::execute()
   bufferlist aclbl;
   bufferlist corsbl;
   bool existed;
-  rgw_obj obj(store->zone.domain_root, s->bucket_name_str);
+  string bucket_name;
+  rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name, bucket_name);
+  rgw_obj obj(store->zone.domain_root, bucket_name);
   obj_version objv, *pobjv = NULL;
 
   ret = get_params();
@@ -1403,7 +1406,8 @@ void RGWCreateBucket::execute()
 
   /* we need to make sure we read bucket info, it's not read before for this specific request */
   RGWObjectCtx& obj_ctx = *static_cast<RGWObjectCtx *>(s->obj_ctx);
-  ret = store->get_bucket_info(obj_ctx, s->bucket_name_str, s->bucket_info, NULL, &s->bucket_attrs);
+  ret = store->get_bucket_info(obj_ctx, s->bucket_tenant, s->bucket_name,
+                               s->bucket_info, NULL, &s->bucket_attrs);
   if (ret < 0 && ret != -ENOENT)
     return;
   s->bucket_exists = (ret != -ENOENT);
@@ -1458,7 +1462,9 @@ void RGWCreateBucket::execute()
   if (s->bucket_exists) {
     string selected_placement_rule;
     rgw_bucket bucket;
-    ret = store->select_bucket_placement(s->user, region_name, placement_rule, s->bucket_name_str, bucket, &selected_placement_rule);
+    ret = store->select_bucket_placement(s->user, region_name, placement_rule,
+                                         s->bucket_tenant, s->bucket_name, bucket,
+                                         &selected_placement_rule);
     if (selected_placement_rule != s->bucket_info.placement_rule) {
       ret = -EEXIST;
       return;
@@ -1473,7 +1479,8 @@ void RGWCreateBucket::execute()
     cors_config.encode(corsbl);
     attrs[RGW_ATTR_CORS] = corsbl;
   }
-  s->bucket.name = s->bucket_name_str;
+  s->bucket.tenant = s->bucket_tenant; /* ignored if bucket exists */
+  s->bucket.name = s->bucket_name;
   ret = store->create_bucket(s->user, s->bucket, region_name, placement_rule, attrs, info, pobjv,
                              &ep_objv, creation_time, pmaster_bucket, true);
   /* continue if EEXIST and create_bucket will fail below.  this way we can recover
@@ -1501,7 +1508,7 @@ void RGWCreateBucket::execute()
 
   ret = rgw_link_bucket(store, s->user.user_id, s->bucket, info.creation_time, false);
   if (ret && !existed && ret != -EEXIST) {  /* if it exists (or previously existed), don't remove it! */
-    ret = rgw_unlink_bucket(store, s->user.user_id, s->bucket.name);
+    ret = rgw_unlink_bucket(store, s->user.user_id, s->bucket.tenant, s->bucket.name);
     if (ret < 0) {
       ldout(s->cct, 0) << "WARNING: failed to unlink bucket: ret=" << ret << dendl;
     }
@@ -1527,7 +1534,7 @@ void RGWDeleteBucket::execute()
 {
   ret = -EINVAL;
 
-  if (s->bucket_name_str.empty())
+  if (s->bucket_name.empty())
     return;
 
   RGWObjVersionTracker ot;
@@ -1553,7 +1560,7 @@ void RGWDeleteBucket::execute()
   ret = store->delete_bucket(s->bucket, ot);
 
   if (ret == 0) {
-    ret = rgw_unlink_bucket(store, s->user.user_id, s->bucket.name, false);
+    ret = rgw_unlink_bucket(store, s->user.user_id, s->bucket.tenant, s->bucket.name, false);
     if (ret < 0) {
       ldout(s->cct, 0) << "WARNING: failed to unlink bucket: ret=" << ret << dendl;
     }
@@ -2237,6 +2244,9 @@ int RGWPutMetadataAccount::verify_permission()
   if (!rgw_user_is_authenticated(s->user)) {
     return -EACCES;
   }
+  // if ((s->perm_mask & RGW_PERM_WRITE) == 0) {
+  //   return -EACCES;
+  // }
   return 0;
 }
 
@@ -2273,14 +2283,8 @@ void RGWPutMetadataAccount::filter_out_temp_url(map<string, bufferlist>& add_att
 
 void RGWPutMetadataAccount::execute()
 {
-  rgw_obj obj;
   map<string, bufferlist> attrs, orig_attrs, rmattrs;
   RGWObjVersionTracker acct_op_tracker;
-
-  /* Get the name of raw object which stores the metadata in its xattrs. */
-  string buckets_obj_id;
-  rgw_get_buckets_obj(s->user.user_id, buckets_obj_id);
-  obj = rgw_obj(store->zone.user_uid_pool, buckets_obj_id);
 
   ret = get_params();
   if (ret < 0) {
@@ -2302,7 +2306,8 @@ void RGWPutMetadataAccount::execute()
     }
   }
 
-  ret = rgw_store_user_attrs(store, s->user.user_id, attrs, &rmattrs, &acct_op_tracker);
+  /* XXX tenant needed? */
+  ret = rgw_store_user_attrs(store, s->user.user_id.id, attrs, &rmattrs, &acct_op_tracker);
   if (ret < 0) {
     return;
   }
@@ -2473,7 +2478,8 @@ void RGWDeleteObj::execute()
 }
 
 
-bool RGWCopyObj::parse_copy_location(const string& url_src, string& bucket_name, rgw_obj_key& key)
+bool RGWCopyObj::parse_copy_location(const string& url_src,
+  string& tenant_name, string& bucket_name, rgw_obj_key& key)
 {
   string name_str;
   string params_str;
@@ -2486,7 +2492,6 @@ bool RGWCopyObj::parse_copy_location(const string& url_src, string& bucket_name,
     params_str = url_src.substr(pos + 1);
   }
 
-
   string dec_src;
 
   url_decode(name_str, dec_src);
@@ -2496,11 +2501,13 @@ bool RGWCopyObj::parse_copy_location(const string& url_src, string& bucket_name,
 
   string str(src);
 
-  pos = str.find("/");
+  pos = str.find('/');
   if (pos <= 0)
     return false;
 
-  bucket_name = str.substr(0, pos);
+  string bucket_str;
+  bucket_str = str.substr(0, pos);
+  rgw_parse_url_bucket(bucket_str, tenant_name, bucket_name);
   key.name = str.substr(pos + 1);
 
   if (key.name.empty()) {
@@ -2533,7 +2540,8 @@ int RGWCopyObj::verify_permission()
 
   RGWObjectCtx& obj_ctx = *static_cast<RGWObjectCtx *>(s->obj_ctx);
 
-  ret = store->get_bucket_info(obj_ctx, s->tenant, src_bucket_name, src_bucket_info, NULL, &src_attrs);
+  ret = store->get_bucket_info(obj_ctx, src_tenant_name, src_bucket_name,
+                               src_bucket_info, NULL, &src_attrs);
   if (ret < 0)
     return ret;
 
@@ -2562,7 +2570,8 @@ int RGWCopyObj::verify_permission()
     dest_bucket_info = src_bucket_info;
     dest_attrs = src_attrs;
   } else {
-    ret = store->get_bucket_info(obj_ctx, s->tenant, dest_bucket_name, dest_bucket_info, NULL, &dest_attrs);
+    ret = store->get_bucket_info(obj_ctx, dest_tenant_name, dest_bucket_name,
+                                 dest_bucket_info, NULL, &dest_attrs);
     if (ret < 0)
       return ret;
   }
