@@ -22,7 +22,6 @@
 #include "include/Context.h"
 #include "common/Finisher.h"
 #include "common/TrackedOp.h"
-#include "os/ObjectStore.h"
 
 class PerfCounters;
 
@@ -58,7 +57,7 @@ public:
   // writes
   virtual bool is_writeable() = 0;
   virtual int make_writeable() = 0;
-  virtual void submit_entry(uint64_t seq, bufferlist& e, uint32_t orig_len,
+  virtual void submit_entry(uint64_t seq, bufferlist& e, int alignment,
 			    Context *oncommit,
 			    TrackedOpRef osd_op = TrackedOpRef()) = 0;
   virtual void commit_start(uint64_t seq) = 0;
@@ -71,8 +70,6 @@ public:
     ) = 0; ///< @return true on successful read, false on journal end
 
   virtual bool should_commit_now() = 0;
-
-  virtual int prepare_entry(list<ObjectStore::Transaction*>& tls, bufferlist* tbl) = 0;
 
   // reads/recovery
   
